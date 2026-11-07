@@ -43,6 +43,12 @@ jobs:
             -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 `
             -RemoteAddress 100.64.0.0/10 -Profile Any | Out-Null
 
+          # RDP over UDP = noticeably lower latency (still Tailscale-only)
+          Remove-NetFirewallRule -DisplayName 'RDP-Tailscale-UDP' -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName 'RDP-Tailscale-UDP' `
+            -Direction Inbound -Action Allow -Protocol UDP -LocalPort 3389 `
+            -RemoteAddress 100.64.0.0/10 -Profile Any | Out-Null
+
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User
