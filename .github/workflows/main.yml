@@ -190,7 +190,7 @@ jobs:
               Invoke-WebRequest -Uri $Url -OutFile $file -UseBasicParsing
               $sig = Get-AuthenticodeSignature $file
               if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch $Vendor) {
-                Write-Host "$Name: signature check failed - skipped."
+                Write-Host "${Name}: signature check failed - skipped."
                 return
               }
               if ($NoWait) { Start-Process -FilePath $file -ArgumentList $InstallArgs }
@@ -322,7 +322,8 @@ jobs:
           Write-Host "==================`n"
 
           # System-wide apps (Steam, VLC) install now, while you connect
-          & "$env:ProgramData\setup-apps.ps1" -Mode System
+          try { & "$env:ProgramData\setup-apps.ps1" -Mode System }
+          catch { Write-Host "App setup failed (RDP keeps running): $($_.Exception.Message)" }
 
           # Keep runner alive
           while ($true) {
