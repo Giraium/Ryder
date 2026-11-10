@@ -1,4 +1,4 @@
-name: win + tailscale + Download.bat script
+name: win + tailscale + apps
 
 # Safe to keep in a PUBLIC repository:
 #  - No password is ever written in this file or printed in the logs.
@@ -8,7 +8,9 @@ name: win + tailscale + Download.bat script
 # Optional secrets:
 #   RDP_PASSWORD          - your own strong password (12+ chars). If missing, a random one is
 #                           generated and served on  http://<tailscale-ip>:8080  (tailnet only).
-#   DOWNLOADS_BAT_SHA256  - SHA-256 of Downloads.bat. If set, the script runs only if it matches.
+#
+# No third-party scripts are downloaded or run. Apps (Steam, VLC, Brave, VS Code, Discord) come
+# from the vendors' official download links and are installed only if their digital signature is valid.
 
 on:
   workflow_dispatch:
@@ -48,6 +50,12 @@ jobs:
           New-NetFirewallRule -DisplayName 'RDP-Tailscale-UDP' `
             -Direction Inbound -Action Allow -Protocol UDP -LocalPort 3389 `
             -RemoteAddress 100.64.0.0/10 -Profile Any | Out-Null
+
+          # Windows Audio is off by default on the runner: enable it so sound works over RDP
+          foreach ($svc in 'AudioEndpointBuilder', 'Audiosrv') {
+            Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service -Name $svc -ErrorAction SilentlyContinue
+          }
 
           Restart-Service -Name TermService -Force
 
@@ -104,6 +112,126 @@ jobs:
           "SERVE_PASSWORD=$serve"  >> $env:GITHUB_ENV
           Write-Host "RDP user is ready."
 
+      - name: Tune display, quality and speed
+        run: |
+          # Best-effort tuning: a failure here never stops the workflow
+          $ErrorActionPreference = 'Continue'
+
+          function Set-Reg($path, $name, $value, $type) {
+            if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+            Set-ItemProperty -Path $path -Name $name -Value $value -Type $type -Force
+          }
+
+          # 1) High performance power plan (no CPU throttling)
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c | Out-Null
+
+          # 2) Time zone: Baghdad
+          Set-TimeZone -Id 'Arabian Standard Time' -ErrorAction SilentlyContinue
+
+          # 3) Keep RDP sessions alive: no idle/disconnect limits, keep-alive packets
+          $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          foreach ($name in 'MaxIdleTime', 'MaxDisconnectionTime', 'MaxConnectionTime') {
+            Set-Reg $pol $name 0 'DWord'
+          }
+          Set-Reg $pol 'KeepAliveEnable' 1 'DWord'
+          Set-Reg $pol 'KeepAliveInterval' 1 'DWord'
+
+          # 3b) Frame rate: RDP's maximum is 60 FPS (default is 30). 15 ms per frame = 60 FPS.
+          Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations' 'DWMFRAMEINTERVAL' 15 'DWord'
+
+          # 4) Stop background services that waste CPU and disk
+          foreach ($svc in 'WSearch', 'SysMain') {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # 5) Defaults for the RDP user (copied from the Default profile at first logon):
+          #    no animations/transparency/wallpaper/screensaver, but crisp ClearType text
+          $hive = 'C:\Users\Default\NTUSER.DAT'
+          if (Test-Path $hive) {
+            reg load HKU\DefUser $hive | Out-Null
+            try {
+              $k = 'Registry::HKEY_USERS\DefUser'
+              $desk = "$k\Control Panel\Desktop"
+              Set-Reg "$k\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" 'VisualFXSetting' 2 'DWord'
+              Set-Reg $desk 'UserPreferencesMask' ([byte[]](0x90,0x12,0x03,0x80,0x10,0x00,0x00,0x00)) 'Binary'
+              Set-Reg $desk 'MenuShowDelay' '0' 'String'
+              Set-Reg $desk 'FontSmoothing' '2' 'String'
+              Set-Reg $desk 'FontSmoothingType' 2 'DWord'
+              Set-Reg $desk 'ScreenSaveActive' '0' 'String'
+              Set-Reg $desk 'Wallpaper' '' 'String'
+              Set-Reg "$desk\WindowMetrics" 'MinAnimate' '0' 'String'
+              Set-Reg "$k\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" 'EnableTransparency' 0 'DWord'
+              Set-Reg "$k\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" 'TaskbarAnimations' 0 'DWord'
+              Write-Host "Display tuning applied to the default profile."
+            }
+            catch {
+              Write-Host "Display tuning skipped: $($_.Exception.Message)"
+            }
+            finally {
+              [gc]::Collect()
+              [gc]::WaitForPendingFinalizers()
+              reg unload HKU\DefUser | Out-Null
+            }
+          }
+
+      - name: Prepare app setup (official installers, signature-checked)
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $setup = @'
+          param([ValidateSet('System','User')][string]$Mode = 'User')
+          $ErrorActionPreference = 'Continue'
+
+          function Install-App {
+            param($Name, $Url, $Vendor, $InstallArgs, [switch]$NoWait)
+            $file = Join-Path $env:TEMP "$Name-setup.exe"
+            try {
+              Invoke-WebRequest -Uri $Url -OutFile $file -UseBasicParsing
+              $sig = Get-AuthenticodeSignature $file
+              if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch $Vendor) {
+                Write-Host "$Name: signature check failed - skipped."
+                return
+              }
+              if ($NoWait) { Start-Process -FilePath $file -ArgumentList $InstallArgs }
+              else { Start-Process -FilePath $file -ArgumentList $InstallArgs -Wait }
+              Write-Host "$Name installed."
+            }
+            catch { Write-Host "$Name failed: $($_.Exception.Message)" }
+            finally { if (-not $NoWait) { Remove-Item $file -Force -ErrorAction SilentlyContinue } }
+          }
+
+          if ($Mode -eq 'System') {
+            # System-wide apps (need admin): installed by the workflow
+            Install-App 'Steam' 'https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe' 'Valve' '/S'
+            Install-App 'VLC' 'https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.exe' 'VideoLAN' '/L=1033 /S'
+            Remove-Item 'C:\Users\Public\Desktop\Epic Games Launcher.lnk', 'C:\Users\Public\Desktop\Unity Hub.lnk' -Force -ErrorAction SilentlyContinue
+          }
+          else {
+            # Per-user apps: installed once, at the RDP user's first logon
+            $flag = Join-Path $env:LOCALAPPDATA 'setup_done.flag'
+            if (Test-Path $flag) { exit 0 }
+            Install-App 'Brave' 'https://laptop-updates.brave.com/latest/winx64' 'Brave' '/silent /install'
+            Install-App 'VSCode' 'https://update.code.visualstudio.com/latest/win32-x64-user/stable' 'Microsoft' '/VERYSILENT /NORESTART /SUPPRESSMSGBOXES /MERGETASKS=!runcode,desktopicon'
+            Install-App 'Discord' 'https://discord.com/api/download?platform=win' 'Discord' '-s' -NoWait
+            New-Item -ItemType File -Path $flag -Force | Out-Null
+          }
+          '@
+
+          Set-Content -Path "$env:ProgramData\setup-apps.ps1" -Value $setup -Encoding UTF8
+
+          # Copied from the Default profile into the RDP user's profile at first logon
+          $startup = 'C:\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
+          New-Item -ItemType Directory -Path $startup -Force | Out-Null
+
+          $cmd = @'
+          @echo off
+          powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%ProgramData%\setup-apps.ps1" -Mode User
+          '@
+
+          Set-Content -Path "$startup\setup-apps.cmd" -Value $cmd -Encoding ASCII
+          Write-Host "App setup prepared."
+
       - name: Install Tailscale
         run: |
           $ErrorActionPreference = 'Stop'
@@ -156,27 +284,8 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Fetch Downloads.bat
-        env:
-          DOWNLOADS_BAT_SHA256: ${{ secrets.DOWNLOADS_BAT_SHA256 }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $downloadUrl = 'https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat'
-          $tmpPath = "$env:RUNNER_TEMP\Downloads.bat"
-
-          Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpPath -UseBasicParsing
-
-          if ([string]::IsNullOrWhiteSpace($env:DOWNLOADS_BAT_SHA256)) {
-            Write-Warning "DOWNLOADS_BAT_SHA256 not set - running Downloads.bat without integrity check."
-          }
-          else {
-            $actual = (Get-FileHash -Path $tmpPath -Algorithm SHA256).Hash
-            if ($actual -ne $env:DOWNLOADS_BAT_SHA256.Trim().ToUpper()) {
-              Write-Error "Downloads.bat hash mismatch - NOT running it."
-              exit 1
-            }
-            Write-Host "Downloads.bat hash verified."
-          }
+          Write-Host "--- Tailscale network check (UDP / nearest relay) ---"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" netcheck
 
       - name: Maintain Connection + Watch RDP User
         run: |
@@ -206,34 +315,8 @@ jobs:
           }
           Write-Host "==================`n"
 
-          $rdpProfile   = 'C:\Users\RDP'
-          $startupPath  = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-          $downloadPath = "$startupPath\Downloads.bat"
-          $verifiedPath = "$env:RUNNER_TEMP\Downloads.bat"
-
-          while ($true) {
-            if (Test-Path $rdpProfile) {
-              try {
-                if (-not (Test-Path $startupPath)) {
-                  New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                }
-                Copy-Item -Path $verifiedPath -Destination $downloadPath -Force
-                Write-Host "Downloads.bat copied to $downloadPath"
-
-                cmd /c $downloadPath
-                Write-Host "Downloads.bat executed successfully"
-                break
-              }
-              catch {
-                Write-Host "Error copying or executing Downloads.bat: $($_.Exception.Message)"
-                break
-              }
-            }
-            else {
-              Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
-              Start-Sleep -Seconds 30
-            }
-          }
+          # System-wide apps (Steam, VLC) install now, while you connect
+          & "$env:ProgramData\setup-apps.ps1" -Mode System
 
           # Keep runner alive
           while ($true) {
