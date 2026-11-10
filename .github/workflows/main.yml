@@ -257,8 +257,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
+          # Never fall back to a manual login link: in a public repo the log is visible to everyone
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            Write-Error "Secret TAILSCALE_AUTHKEY is missing in this repository - stopping."
+            exit 1
+          }
+
           & $ts up --authkey=$env:TS_AUTHKEY "--hostname=gh-runner-$($env:GITHUB_RUN_ID)" `
-            --unattended --accept-dns=false --accept-routes=false
+            --unattended --accept-dns=false --accept-routes=false --timeout=60s
 
           $tsIP = $null
           $retries = 0
