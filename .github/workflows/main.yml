@@ -672,6 +672,9 @@ jobs:
 
           $info = Restore-State
           Write-Host ("Drop files: {0} | Work: {1}" -f $info.drop_release, $info.work)
+          # Missing "drop"/"work" releases are expected on the first run and leave
+          # $LASTEXITCODE = 1; Actions would turn that into a failed step. Reset it.
+          $global:LASTEXITCODE = 0
 
       - name: Install Tailscale
         run: |
