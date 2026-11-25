@@ -1,0 +1,19 @@
+name = "ryder-bot"
+main = "worker.js"
+compatibility_date = "2025-06-01"
+
+[observability]
+enabled = true
+
+# Non-secret settings. Secrets (GH_BOT_PAT, FILES_PAT, DISCORD_LOG_WEBHOOK) are pushed by the deploy workflow.
+[vars]
+APP_ID = "1574886180028153927"
+GUILD_ID = "1065284766326341652"
+OWNER_ID = "909928697308512296"
+DISCORD_PUBLIC_KEY = "d7df8085e8df530804aeff0966d6c52d01c915285d10853de64da6cc72f754da"
+REPO = "Giraium/Ryder"
+WORKFLOW = "main.yml"
+REF = "main"
+FILES_REPO = "Giraium/Ryder-files"
+# /exec runs commands inside the session. Keep "false" unless you really want it.
+ENABLE_EXEC = "false"
