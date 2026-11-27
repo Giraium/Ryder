@@ -259,7 +259,7 @@ const COMMANDS = {
   async help() {
     return {
       kind: 'info',
-      title: '🧭 دليل أوامر Ryder',
+      title: '🧭 دليل أوامر YjaRdp',
       subtitle: 'لوحة التحكم بجلسات سطح المكتب البعيد',
       lead: 'تدير هذه الأوامر جلسة Windows البعيدة العاملة عبر GitHub Actions وTailscale. الاستخدام مقصور على مالك الخادم.',
       sections: [
