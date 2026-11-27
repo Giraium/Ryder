@@ -5,7 +5,7 @@ compatibility_date = "2025-06-01"
 [observability]
 enabled = true
 
-# Non-secret settings. Secrets (GH_BOT_PAT, FILES_PAT, DISCORD_LOG_WEBHOOK) are pushed by the deploy workflow.
+# Non-secret settings. Secrets (GH_BOT_PAT, FILES_PAT, DISCORD_LOG_WEBHOOK, DISCORD_NOTIFY_WEBHOOK) are pushed by the deploy workflow.
 [vars]
 APP_ID = "1574886180028153927"
 GUILD_ID = "1065284766326341652"
@@ -17,3 +17,8 @@ REF = "main"
 FILES_REPO = "Giraium/Ryder-files"
 # /exec runs commands inside the session. Keep "false" unless you really want it.
 ENABLE_EXEC = "false"
+
+# "true": command replies are visible to everyone in the channel. "false": only you see them.
+PUBLIC_REPLIES = "true"
+# "v2": modern Components V2 cards. "classic": plain embeds (use it if Discord ever rejects the cards).
+UI_MODE = "v2"

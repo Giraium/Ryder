@@ -1,31 +1,51 @@
 // Ryder control bot - Cloudflare Worker (Discord Interactions over HTTP, no always-on server needed)
-// Commands: /start /stop /status /logs /history /help /exec
-// Only the owner (OWNER_ID) in the configured server (GUILD_ID) can use it.
+//
+//   POST /        Discord interactions: /start /stop /status /logs /history /help /exec + buttons
+//   POST /event   session events sent by main.yml (signed with HMAC), rendered here and posted to the notify channel
+//   GET  /        health check
+//
+// Only the owner (OWNER_ID) in the configured server (GUILD_ID) can use the commands.
+// All message design lives in ui.mjs (Components V2, with an automatic classic-embed fallback).
+//
+// Settings (bot/wrangler.toml [vars]):
+//   PUBLIC_REPLIES  "true" (default): command replies are visible to everyone in the channel; "false": only you see them
+//   UI_MODE         "v2" (default): Components V2 cards; "classic": plain embeds
+
+import {
+  SESSION_LIMIT_MIN,
+  FLAG_EPHEMERAL,
+  bar,
+  button,
+  link,
+  code,
+  ts,
+  fmtDuration,
+  presetLabel,
+  yesNo,
+  statusAr,
+  render,
+  uiMode,
+  postWebhook,
+  eventSpec,
+  auditSpec,
+} from './ui.mjs';
 
 const DISCORD_API = 'https://discord.com/api/v10';
 const GH_API = 'https://api.github.com';
-const SESSION_LIMIT_MIN = 355; // keep equal to timeout-minutes in main.yml
 const ACTIVE = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
-const COLORS = { ok: 0x2ecc71, warn: 0xf1c40f, err: 0xe74c3c, info: 0x3498db };
 const enc = new TextEncoder();
 
 // ------------------------------------------------------------------ small helpers
-const json = (obj, status = 200) =>
-  new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
-const ephemeral = (content) => json({ type: 4, data: { content, flags: 64 } });
-const deferred = () => json({ type: 5, data: { flags: 64 } });
+const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
+const isPublic = (env) => String(env.PUBLIC_REPLIES ?? 'true').toLowerCase() !== 'false';
+const deferred = (env) => json(isPublic(env) ? { type: 5 } : { type: 5, data: { flags: FLAG_EPHEMERAL } });
 const deferredUpdate = () => json({ type: 6 });
 const newId = () => crypto.randomUUID().slice(0, 8);
 
-function embed(kind, title, description = '', fields = []) {
-  return {
-    title,
-    description: description.slice(0, 4000),
-    color: COLORS[kind] ?? COLORS.info,
-    fields: fields.map((f) => ({ name: f.name, value: String(f.value).slice(0, 1000) || '-', inline: !!f.inline })),
-    timestamp: new Date().toISOString(),
-    footer: { text: 'Ryder' },
-  };
+// refusals are always private, even when normal replies are public
+function privateCard(env, spec) {
+  const p = render(spec, uiMode(env));
+  return json({ type: 4, data: { ...p, flags: (p.flags || 0) | FLAG_EPHEMERAL } });
 }
 
 function hexToBytes(hex) {
@@ -42,15 +62,7 @@ function b64(str) {
   return btoa(bin);
 }
 
-function fmtDuration(ms) {
-  const m = Math.max(0, Math.round(ms / 60000));
-  const h = Math.floor(m / 60);
-  return h ? `${h}س ${m % 60}د` : `${m}د`;
-}
-
-const unix = (ms) => Math.floor(ms / 1000);
-
-// ------------------------------------------------------------------ Discord signature check
+// ------------------------------------------------------------------ signature checks
 async function importKey(publicKeyHex) {
   const raw = hexToBytes(publicKeyHex);
   try {
@@ -61,14 +73,27 @@ async function importKey(publicKeyHex) {
   }
 }
 
+// Discord -> Worker (Ed25519)
 async function verifySignature(request, rawBody, publicKeyHex) {
   const sig = request.headers.get('x-signature-ed25519');
-  const ts = request.headers.get('x-signature-timestamp');
-  if (!sig || !ts || !publicKeyHex) return false;
-  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false; // replay protection (5 min)
+  const ts_ = request.headers.get('x-signature-timestamp');
+  if (!sig || !ts_ || !publicKeyHex) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts_)) > 300) return false; // replay protection (5 min)
   try {
     const key = await importKey(publicKeyHex);
-    return await crypto.subtle.verify(key.algorithm.name, key, hexToBytes(sig), enc.encode(ts + rawBody));
+    return await crypto.subtle.verify(key.algorithm.name, key, hexToBytes(sig), enc.encode(ts_ + rawBody));
+  } catch {
+    return false;
+  }
+}
+
+// main.yml -> Worker (HMAC-SHA256 keyed with the notify webhook URL, which only the repo and the Worker know)
+async function verifyHmac(secret, tsHeader, rawBody, sigHex) {
+  if (!secret || !tsHeader || !sigHex) return false;
+  if (Math.abs(Date.now() / 1000 - Number(tsHeader)) > 300) return false;
+  try {
+    const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+    return await crypto.subtle.verify('HMAC', key, hexToBytes(sigHex), enc.encode(`${tsHeader}.${rawBody}`));
   } catch {
     return false;
   }
@@ -109,43 +134,39 @@ const wfPath = (env) => `/repos/${env.REPO}/actions/workflows/${env.WORKFLOW}`;
 const listRuns = async (env, perPage = 8) => (await ghJson(env, `${wfPath(env)}/runs?per_page=${perPage}`)).workflow_runs || [];
 const activeRuns = async (env) => (await listRuns(env, 10)).filter((r) => ACTIVE.has(r.status));
 
-function friendlyError(e) {
+// ------------------------------------------------------------------ errors
+function explain(e) {
   if (e instanceof GhError) {
-    if (e.status === 401) return 'توكن GH_BOT_PAT منتهي أو غير صحيح.';
-    if (e.status === 403) return 'توكن GH_BOT_PAT ما عنده صلاحية (لازم Actions: Read and write على ريبو Ryder).';
-    if (e.status === 404) return 'ما لقيت الريبو أو الـ workflow، أو التوكن ما يصل له. تأكد من REPO و WORKFLOW.';
-    if (e.status === 422) return 'GitHub رفض المدخلات. غالباً ملف main.yml المرفوع ما فيه الـ inputs الجديدة.';
-    return `خطأ من GitHub (${e.status}): ${e.body}`;
+    if (e.status === 401) return { cause: 'توكن GH_BOT_PAT منتهي الصلاحية أو غير صحيح.', fix: `أنشئ توكناً جديداً، وحدّث السر ${code('GH_BOT_PAT')} في المستودع، ثم أعد نشر البوت.` };
+    if (e.status === 403) return { cause: 'التوكن لا يملك الصلاحية الكافية.', fix: `امنحه الصلاحية ${code('Actions: Read and write')} على مستودع Ryder.` };
+    if (e.status === 404) return { cause: 'تعذّر العثور على المستودع أو الـ workflow، أو أن التوكن لا يصل إليهما.', fix: `راجع القيمتين ${code('REPO')} و${code('WORKFLOW')} في ملف bot/wrangler.toml وصلاحيات التوكن.` };
+    if (e.status === 422) return { cause: 'رفض GitHub المدخلات المرسلة.', fix: `غالباً أن ملف main.yml المرفوع لا يحتوي المدخلات (inputs) الجديدة. ارفع آخر نسخة منه.` };
+    return { cause: `ردّ GitHub بخطأ (${e.status}).`, fix: 'أعد المحاولة بعد قليل، وإن تكرر الأمر فراجع سجل Cloudflare Workers.' };
   }
-  return 'خطأ غير متوقع بالبوت.';
+  return { cause: 'حدث خطأ غير متوقع داخل البوت.', fix: 'أعد المحاولة، وإن تكرر الأمر فابحث عن معرّف الخطأ في سجل Cloudflare Workers.' };
 }
 
+const errorSpec = (e, errorId) => ({
+  kind: 'err',
+  title: '❌ تعذّر تنفيذ الأمر',
+  lead: explain(e).cause,
+  sections: [{ heading: 'الحل المقترح', text: explain(e).fix }],
+  footer: `Ryder · معرّف الخطأ ${errorId}`,
+  compact: true,
+});
+
+const noteSpec = (kind, title, lead, extra = {}) => ({ kind, title, lead, compact: true, ...extra });
+
 // ------------------------------------------------------------------ logging (console JSON + Discord log channel)
-async function logToDiscord(env, kind, title, fields) {
+async function audit(env, entry) {
+  const { detail, ...forConsole } = entry; // free-text details (e.g. the /exec command) go to the log channel only
+  console.log(JSON.stringify({ ts: new Date().toISOString(), ...forConsole }));
   if (!env.DISCORD_LOG_WEBHOOK) return;
   try {
-    await fetch(env.DISCORD_LOG_WEBHOOK, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'Ryder Log', allowed_mentions: { parse: [] }, embeds: [embed(kind, title, '', fields)] }),
-    });
+    await postWebhook(env.DISCORD_LOG_WEBHOOK, auditSpec(entry), { mode: uiMode(env), username: 'Ryder Log' });
   } catch (e) {
     console.error(JSON.stringify({ level: 'error', msg: 'log webhook failed', err: String(e) }));
   }
-}
-
-async function audit(env, entry) {
-  console.log(JSON.stringify({ ts: new Date().toISOString(), ...entry }));
-  const kind = entry.ok === false ? 'err' : entry.denied ? 'warn' : 'info';
-  const title = entry.denied ? '⛔ محاولة غير مصرّح بها' : `/${entry.command ?? entry.action}`;
-  const fields = [
-    { name: 'المستخدم', value: `<@${entry.user}> (${entry.user})`, inline: true },
-    { name: 'النتيجة', value: entry.denied ? 'مرفوض' : entry.ok === false ? 'خطأ' : 'نجح', inline: true },
-  ];
-  if (entry.ms !== undefined) fields.push({ name: 'الزمن', value: `${entry.ms}ms`, inline: true });
-  if (entry.options && Object.keys(entry.options).length) fields.push({ name: 'الخيارات', value: '```json\n' + JSON.stringify(entry.options).slice(0, 900) + '\n```' });
-  if (entry.errorId) fields.push({ name: 'معرّف الخطأ', value: entry.errorId, inline: true });
-  await logToDiscord(env, kind, title, fields);
 }
 
 // ------------------------------------------------------------------ log text cleaning
@@ -162,8 +183,8 @@ function sanitizeLog(text) {
     .replace(/\n{3,}/g, '\n\n');
 }
 
-// ------------------------------------------------------------------ commands
-const STEP_AR = [
+// ------------------------------------------------------------------ session helpers
+const PHASES = [
   ['Configure Core RDP', 'ضبط RDP'],
   ['Create RDP User', 'إنشاء المستخدم'],
   ['Tune display', 'ضبط الأداء'],
@@ -173,50 +194,108 @@ const STEP_AR = [
   ['Install Tailscale', 'تثبيت Tailscale'],
   ['Establish Tailscale', 'اتصال Tailscale'],
   ['Verify RDP', 'فحص RDP'],
-  ['Announce', 'إرسال الإشعار'],
-  ['Maintain', 'جاهزة للاتصال'],
-  ['Cleanup', 'إنهاء الجلسة'],
+  ['Announce', 'إرسال إشعار الجاهزية'],
 ];
-const stepAr = (name = '') => (STEP_AR.find(([k]) => name.includes(k)) || [null, name])[1];
+const PROGRESS_TOTAL = PHASES.length + 1; // +1 = "ready for connection"
+const stepAr = (name = '') => (PHASES.find(([k]) => name.includes(k)) || [null, name])[1];
+
+const mdLink = (r) => `[#${r.run_number}](${r.html_url})`;
+const runDuration = (r) => Date.parse(r.updated_at) - Date.parse(r.run_started_at || r.created_at);
+
+function outcome(r) {
+  if (r.status !== 'completed') return '⏳ جارية';
+  if (r.conclusion === 'success') return '✅ اكتملت';
+  if (r.conclusion === 'failure') return '❌ انتهت بخطأ';
+  if (r.conclusion === 'cancelled') return '⏹️ أُلغيت';
+  return `⚪ ${r.conclusion || r.status}`;
+}
 
 async function describeRun(env, run) {
   const jobs = await ghJson(env, `/repos/${env.REPO}/actions/runs/${run.id}/jobs`);
   const job = jobs.jobs?.[0];
-  let phase = 'بالانتظار على GitHub';
-  if (job && job.status !== 'queued') {
-    const cur = (job.steps || []).find((s) => s.status === 'in_progress');
-    phase = cur ? (cur.name.includes('Maintain') ? '🟢 جاهزة للاتصال' : `⏳ ${stepAr(cur.name)}`) : '⏳ جاري التجهيز';
-  }
+  const steps = job?.steps || [];
+  const stepOf = (key) => steps.find((s) => s.name.includes(key));
+  const ready = stepOf('Maintain')?.status === 'in_progress';
+  const cur = steps.find((s) => s.status === 'in_progress');
+  const queued = !job || job.status === 'queued';
+  const done = ready ? PROGRESS_TOTAL : PHASES.filter(([k]) => stepOf(k)?.status === 'completed').length;
   const startMs = Date.parse(job?.started_at || run.run_started_at || run.created_at);
-  const elapsed = Date.now() - startMs;
-  const endMs = startMs + SESSION_LIMIT_MIN * 60000;
-  return { phase, elapsed, endMs, job };
+  return {
+    ready,
+    done,
+    phase: queued ? 'بالانتظار على GitHub' : ready ? 'جاهزة للاتصال' : cur ? stepAr(cur.name) : 'جارٍ التجهيز',
+    startMs,
+    elapsed: Date.now() - startMs,
+    endMs: startMs + SESSION_LIMIT_MIN * 60000,
+  };
 }
 
+function idleSpec(env, last) {
+  const quick = button('تشغيل جلسة جديدة', 'start:quick', 3, '▶️');
+  if (!last) {
+    return { kind: 'idle', title: '⚪ لا توجد جلسة جارية', lead: 'لا توجد جلسات سابقة بعد. ابدأ بتشغيل أول جلسة.', buttons: [quick] };
+  }
+  return {
+    kind: 'idle',
+    title: '⚪ لا توجد جلسة جارية',
+    lead: `آخر جلسة كانت ${mdLink(last)}، وقد ${outcome(last).replace(/^\S+\s/, '')} ${ts(Date.parse(last.updated_at))}.`,
+    sections: [
+      {
+        heading: 'آخر جلسة',
+        facts: [
+          ['الرقم', mdLink(last)],
+          ['النتيجة', outcome(last)],
+          ['المدة', fmtDuration(runDuration(last))],
+          ['انتهت', ts(Date.parse(last.updated_at))],
+        ],
+      },
+    ],
+    buttons: [quick, link('سجل آخر جلسة', last.html_url, '📄')],
+  };
+}
+
+// ------------------------------------------------------------------ commands (each returns a message spec; ui.mjs renders it)
 const COMMANDS = {
   async help() {
     return {
-      embeds: [
-        embed('info', 'أوامر Ryder', '', [
-          { name: '/start', value: 'تشغيل جلسة جديدة (preset، vscode، discord، extra_tools، auto_renew، max_renewals).' },
-          { name: '/stop', value: 'إيقاف الجلسة الشغالة (مع تأكيد). يوقف أيضاً أي جلسة تجديد جديدة.' },
-          { name: '/status', value: 'حالة الجلسة والوقت المتبقي.' },
-          { name: '/logs', value: 'آخر أسطر سجل الجلسة (الأسرار تنخفي).' },
-          { name: '/history', value: 'آخر الجلسات ونتيجة كل وحدة.' },
-          { name: '/exec', value: 'تنفيذ أمر داخل الجلسة (معطّل افتراضياً).' },
-        ]),
+      kind: 'info',
+      title: '🧭 دليل أوامر Ryder',
+      subtitle: 'لوحة التحكم بجلسات سطح المكتب البعيد',
+      lead: 'تدير هذه الأوامر جلسة Windows البعيدة العاملة عبر GitHub Actions وTailscale. الاستخدام مقصور على مالك الخادم.',
+      sections: [
+        {
+          heading: 'إدارة الجلسة',
+          items: [
+            `${code('/start')} يُطلق جلسة جديدة بالإعداد الذي تختاره، مع تجديد تلقائي قبل بلوغ حدّ الست ساعات.`,
+            `${code('/stop')} يُنهي الجلسات الجارية بعد طلب تأكيد صريح.`,
+            `${code('/status')} يعرض حالة الجلسة ومراحل التجهيز والوقت المتبقي، مع زر تحديث فوري.`,
+          ],
+        },
+        {
+          heading: 'المتابعة والتدقيق',
+          items: [`${code('/logs')} يعرض أحدث أسطر السجل بعد حجب الأسرار تلقائياً.`, `${code('/history')} يلخّص آخر الجلسات ونتائجها وإحصاءاتها.`],
+        },
+        { heading: 'متقدّم', items: [`${code('/exec')} ينفّذ أمراً داخل الجلسة، وهو معطَّل افتراضياً لأسباب أمنية.`] },
+        {
+          heading: 'نصائح',
+          items: ['تصلك رسالة «الجلسة جاهزة» في قناة ryder-notify فور اكتمال التجهيز.', 'تُحجب المفاتيح والتوكنات من أي سجل يعرضه البوت.', 'استخدم زر «تشغيل سريع» للبدء بالإعدادات الافتراضية دون كتابة أي خيار.'],
+        },
       ],
+      buttons: [button('حالة الجلسة', 'status:refresh', 2, '📡'), button('تشغيل سريع', 'start:quick', 3, '▶️')],
     };
   },
 
-  async start(i, env, o) {
+  async start(i, env, o = {}) {
     const active = await activeRuns(env);
     if (active.length) {
-      return { embeds: [embed('warn', 'فيه جلسة شغالة', `الجلسة #${active[0].run_number} بحالة \`${active[0].status}\`. استخدم /status أو /stop.`, [{ name: 'الرابط', value: active[0].html_url }])] };
+      return noteSpec('warn', '⚠️ توجد جلسة جارية بالفعل', `الجلسة ${mdLink(active[0])} حالتها: ${statusAr(active[0].status)}.`, {
+        sections: [{ heading: 'الخيارات المتاحة', items: [`تابع حالتها بالأمر ${code('/status')}.`, `أو أوقفها بالأمر ${code('/stop')} ثم أطلق جلسة جديدة.`] }],
+        buttons: [button('حالة الجلسة', 'status:refresh', 2, '📡'), link('فتح السجل', active[0].html_url, '📄')],
+      });
     }
     const extra = (o.extra_tools || '').trim();
     if (extra && !/^[a-z0-9][a-z0-9.,\s-]{0,198}$/i.test(extra)) {
-      return { embeds: [embed('err', 'أسماء الحزم غير صالحة', 'استخدم أسماء حزم Chocolatey مفصولة بفاصلة فقط.')] };
+      return noteSpec('err', '❌ أسماء الحزم غير صالحة', `استخدم أسماء حزم Chocolatey مفصولة بفاصلة فقط، مثل: ${code('nmap,7zip')}.`);
     }
     const execAllowed = env.ENABLE_EXEC === 'true';
     const inputs = {
@@ -231,69 +310,82 @@ const COMMANDS = {
     };
     const res = await gh(env, `${wfPath(env)}/dispatches`, { method: 'POST', body: { ref: env.REF || 'main', inputs } });
     if (res.status !== 204) throw new GhError(res.status, await res.text());
+
+    const renew = inputs.auto_renew === 'true' ? `مفعّل (${inputs.max_renewals === '0' ? 'بلا حدّ' : `حتى ${inputs.max_renewals} مرات`})` : 'معطّل';
     return {
-      embeds: [
-        embed('ok', '🚀 تم إرسال أمر التشغيل', 'تجيك رسالة بقناة ryder-notify لما تصير الجلسة جاهزة (عادة 5-10 دقائق).', [
-          { name: 'الإعداد', value: inputs.preset, inline: true },
-          { name: 'تجديد تلقائي', value: inputs.auto_renew === 'true' ? `نعم (حتى ${inputs.max_renewals === '0' ? 'بلا حد' : inputs.max_renewals})` : 'لا', inline: true },
-          { name: 'أوامر عن بعد', value: inputs.remote_exec === 'true' ? 'مفعّلة' : 'معطّلة', inline: true },
-        ]),
+      kind: 'ok',
+      title: '🚀 أُرسل أمر التشغيل',
+      lead: 'بدأ تجهيز الجلسة على GitHub. ستصلك رسالة «الجلسة جاهزة» في قناة ryder-notify فور اكتمال التجهيز، وعادةً يستغرق ذلك من 5 إلى 10 دقائق.',
+      sections: [
+        {
+          heading: 'الإعداد المختار',
+          facts: [
+            ['الإعداد المسبق', presetLabel(inputs.preset)],
+            ['Visual Studio Code', yesNo(inputs.install_vscode)],
+            ['Discord', yesNo(inputs.install_discord)],
+            extra ? ['حزم إضافية', code(extra)] : null,
+            ['التجديد التلقائي', renew],
+            ['أوامر عن بُعد', inputs.remote_exec === 'true' ? 'مفعّلة' : 'معطّلة'],
+          ],
+        },
+        { heading: 'الخطوات التالية', items: ['تجهيز الجلسة على GitHub، ويستغرق من 5 إلى 10 دقائق.', 'وصول رسالة «الجلسة جاهزة» إلى قناة ryder-notify.', 'الاتصال عبر Windows App باستخدام العنوان المرسل.'] },
       ],
+      buttons: [button('حالة الجلسة', 'status:refresh', 2, '📡'), link('صفحة التشغيل', `https://github.com/${env.REPO}/actions/workflows/${env.WORKFLOW}`, '🔗')],
     };
   },
 
   async status(i, env) {
     const runs = await listRuns(env, 5);
     const active = runs.filter((r) => ACTIVE.has(r.status));
-    if (!active.length) {
-      const last = runs[0];
-      return {
-        embeds: [
-          embed('info', 'ما فيه جلسة شغالة', last ? `آخر جلسة: #${last.run_number} (${last.conclusion || last.status}) <t:${unix(Date.parse(last.updated_at))}:R>` : 'ما فيه جلسات سابقة.', last ? [{ name: 'الرابط', value: last.html_url }] : []),
+    if (!active.length) return idleSpec(env, runs[0]);
+
+    const run = active[0];
+    const d = await describeRun(env, run);
+    const sections = [
+      { heading: 'التقدّم', text: `${bar(d.done, PROGRESS_TOTAL)} · ${d.done} / ${PROGRESS_TOTAL}\nالمرحلة الحالية: **${d.phase}**` },
+      {
+        heading: 'الزمن',
+        facts: [
+          ['المدة المنقضية', fmtDuration(d.elapsed)],
+          ['المتبقي', `${ts(d.endMs, 'R')} (${ts(d.endMs, 't')})`],
         ],
-      };
+      },
+    ];
+    if (d.ready) {
+      sections.push({ heading: 'الاتصال', facts: [['الاسم', code('ryder')], ['المستخدم', code('RDP')]], text: 'العنوان وبقية البيانات في رسالة «الجلسة جاهزة» بقناة ryder-notify.' });
     }
-    const embeds = [];
-    for (const run of active.slice(0, 2)) {
-      const d = await describeRun(env, run);
-      embeds.push(
-        embed('ok', `الجلسة #${run.run_number}`, '', [
-          { name: 'الحالة', value: d.phase, inline: true },
-          { name: 'المدة', value: fmtDuration(d.elapsed), inline: true },
-          { name: 'تنتهي تقريباً', value: `<t:${unix(d.endMs)}:R>`, inline: true },
-          { name: 'الاسم', value: 'ryder (Tailscale)', inline: true },
-          { name: 'الرابط', value: run.html_url },
-        ]),
-      );
-    }
-    if (active.length > 1) embeds.push(embed('info', 'ملاحظة', 'فيه جلستين بنفس الوقت: غالباً تجديد تلقائي. انتقل للأحدث.'));
-    return { embeds };
+    return {
+      kind: d.ready ? 'ok' : 'info',
+      title: d.ready ? `🟢 الجلسة #${run.run_number} جاهزة للاتصال` : `⏳ الجلسة #${run.run_number} قيد التجهيز`,
+      subtitle: `بدأت ${ts(d.startMs, 'R')}`,
+      lead: active.length > 1 ? 'توجد أكثر من جلسة جارية، وغالباً أن ذلك بسبب التجديد التلقائي. انتقل إلى الأحدث.' : undefined,
+      sections,
+      buttons: [button('تحديث', 'status:refresh', 2, '🔄'), link('سجل التشغيل', run.html_url, '📄'), button('إيقاف', 'stop:ask', 4, '⏹️')],
+    };
   },
 
   async stop(i, env) {
     const active = await activeRuns(env);
-    if (!active.length) return { embeds: [embed('info', 'ما فيه جلسة شغالة')] };
+    if (!active.length) return idleSpec(env, (await listRuns(env, 1))[0]);
     return {
-      embeds: [embed('warn', 'تأكيد الإيقاف', `راح أوقف ${active.length} جلسة:\n` + active.map((r) => `• #${r.run_number} (${r.status})`).join('\n'))],
-      components: [
-        {
-          type: 1,
-          components: [
-            { type: 2, style: 4, label: 'أوقف الكل', custom_id: 'stop:all' },
-            { type: 2, style: 2, label: 'إلغاء', custom_id: 'stop:cancel' },
-          ],
-        },
+      kind: 'warn',
+      title: '⏹️ تأكيد إيقاف الجلسة',
+      lead: 'سيُنهي هذا الإجراء الجلسات الجارية فوراً، وينقطع اتصالك بها.',
+      sections: [
+        { heading: 'الجلسات المستهدفة', items: active.map((r) => `${mdLink(r)} · ${statusAr(r.status)}`) },
+        { heading: 'ما يحدث عند الإيقاف', items: ['ينقطع اتصال سطح المكتب البعيد فوراً.', 'تعمل خطوة التنظيف تلقائياً لحفظ Work ورفع Outbox قبل الإغلاق، قدر الإمكان.', 'تُلغى كذلك أي جلسة تجديد قيد التشغيل.'] },
       ],
+      buttons: [button('تأكيد الإيقاف', 'stop:all', 4, '⏹️'), button('تراجع', 'stop:cancel', 2, '↩️')],
     };
   },
 
-  async logs(i, env, o) {
+  async logs(i, env, o = {}) {
     const lines = Math.min(100, Math.max(5, Number(o.lines) || 40));
     const run = (await listRuns(env, 1))[0];
-    if (!run) return { embeds: [embed('info', 'ما فيه سجلات')] };
+    if (!run) return noteSpec('info', '📜 لا توجد سجلات', 'لم تُشغَّل أي جلسة بعد.');
     const jobs = await ghJson(env, `/repos/${env.REPO}/actions/runs/${run.id}/jobs`);
     const job = jobs.jobs?.[0];
-    if (!job) return { embeds: [embed('info', 'السجل غير جاهز بعد', 'الجلسة لسا بالانتظار.', [{ name: 'الرابط', value: run.html_url }])] };
+    if (!job) return noteSpec('info', '📜 السجل غير جاهز بعد', 'الجلسة ما زالت بالانتظار على GitHub.', { buttons: [link('فتح السجل', run.html_url, '📄')] });
 
     const res = await gh(env, `/repos/${env.REPO}/actions/jobs/${job.id}/logs`, { manualRedirect: true });
     let text = null;
@@ -304,41 +396,60 @@ const COMMANDS = {
       text = await res.text();
     }
     if (!text) {
-      return { embeds: [embed('warn', 'السجل غير متاح الحين', 'GitHub ما يعطي سجل الـ job كامل أثناء التشغيل. افتح الرابط لتشوف الأسطر الحية.', [{ name: 'الرابط', value: run.html_url }])] };
+      return noteSpec('warn', '📜 السجل غير متاح الآن', 'لا يوفّر GitHub سجل الـ job كاملاً أثناء التشغيل. افتح الرابط لمتابعة الأسطر الحيّة.', {
+        buttons: [button('إعادة المحاولة', `logs:${lines}`, 2, '🔄'), link('فتح السجل', run.html_url, '📄')],
+      });
     }
-    let out = sanitizeLog(text).split('\n').filter((l) => l.trim()).slice(-lines).join('\n');
-    if (out.length > 1800) out = '…' + out.slice(-1800);
-    return { embeds: [embed('info', `آخر ${lines} سطر - جلسة #${run.run_number}`, '```\n' + out.replace(/```/g, "'''") + '\n```', [{ name: 'الرابط', value: run.html_url }])] };
+    const out = sanitizeLog(text).split('\n').filter((l) => l.trim()).slice(-lines).join('\n');
+    return {
+      kind: 'info',
+      title: `📜 آخر ${lines <= 10 ? (lines === 1 ? 'سطر' : lines === 2 ? 'سطرين' : lines + ' أسطر') : lines + ' سطراً'} من السجل`,
+      subtitle: `الجلسة #${run.run_number} · ${ts(Date.now(), 'R')}`,
+      sections: [{ code: out }],
+      buttons: [button('تحديث', `logs:${lines}`, 2, '🔄'), link('السجل الكامل', run.html_url, '📄')],
+    };
   },
 
   async history(i, env) {
     const runs = await listRuns(env, 8);
-    if (!runs.length) return { embeds: [embed('info', 'ما فيه جلسات')] };
+    if (!runs.length) return noteSpec('info', '🗂️ لا توجد جلسات', 'لم تُشغَّل أي جلسة بعد.', { buttons: [button('تشغيل جلسة جديدة', 'start:quick', 3, '▶️')] });
     const rows = runs.map((r) => {
-      const dur = Date.parse(r.updated_at) - Date.parse(r.run_started_at || r.created_at);
-      let icon = '⏳';
+      const dur = runDuration(r);
       let note = '';
-      if (r.status === 'completed') {
-        if (r.conclusion === 'success') icon = '✅';
-        else if (r.conclusion === 'failure') icon = '❌';
-        else if (r.conclusion === 'cancelled') {
-          icon = '⏹️';
-          note = dur >= (SESSION_LIMIT_MIN - 8) * 60000 ? ' (وصلت سقف الوقت ~6 ساعات)' : ' (إيقاف/إلغاء)';
-        } else icon = '⚪';
-      }
-      return `${icon} #${r.run_number} - ${fmtDuration(dur)}${note} - <t:${unix(Date.parse(r.created_at))}:R>`;
+      if (r.status === 'completed' && r.conclusion === 'cancelled') note = dur >= (SESSION_LIMIT_MIN - 8) * 60000 ? ' · بلغت حدّ الوقت' : ' · إيقاف يدوي';
+      return `${outcome(r).split(' ')[0]} ${mdLink(r)} · ${fmtDuration(dur)}${note} · ${ts(Date.parse(r.created_at))}`;
     });
-    return { embeds: [embed('info', 'آخر الجلسات', rows.join('\n'))] };
+    const finished = runs.filter((r) => r.status === 'completed');
+    const count = (c) => finished.filter((r) => r.conclusion === c).length;
+    const total = finished.reduce((n, r) => n + Math.max(0, runDuration(r)), 0);
+    return {
+      kind: 'info',
+      title: '🗂️ سجلّ الجلسات',
+      subtitle: `آخر ${runs.length} جلسات`,
+      sections: [
+        { heading: 'الجلسات', items: rows },
+        {
+          heading: 'إحصاءات',
+          facts: [
+            ['المكتملة', `${count('success')}`],
+            ['المُلغاة', `${count('cancelled')}`],
+            ['المنتهية بخطأ', `${count('failure')}`],
+            ['إجمالي مدة التشغيل', fmtDuration(total)],
+          ],
+        },
+      ],
+      buttons: [button('تحديث', 'history:refresh', 2, '🔄'), button('تشغيل جلسة جديدة', 'start:quick', 3, '▶️')],
+    };
   },
 
-  async exec(i, env, o) {
+  async exec(i, env, o = {}) {
     if (env.ENABLE_EXEC !== 'true') {
-      return { embeds: [embed('warn', 'الأمر معطّل', 'فعّله بـ ENABLE_EXEC = "true" بملف bot/wrangler.toml، وشغّل الجلسة مع remote_exec.')] };
+      return noteSpec('warn', '🔒 الأمر معطّل', `فعّله بضبط ${code('ENABLE_EXEC = "true"')} في ملف bot/wrangler.toml، ثم شغّل الجلسة مع الخيار ${code('remote_exec')}.`);
     }
     const cmd = String(o.command || '').trim();
-    if (!cmd || cmd.length > 1500) return { embeds: [embed('err', 'أمر غير صالح', 'الأمر فاضي أو أطول من 1500 حرف.')] };
+    if (!cmd || cmd.length > 1500) return noteSpec('err', '❌ أمر غير صالح', 'الأمر فارغ أو يتجاوز 1500 حرف.');
     const active = await activeRuns(env);
-    if (!active.length) return { embeds: [embed('warn', 'ما فيه جلسة شغالة')] };
+    if (!active.length) return noteSpec('warn', '⚠️ لا توجد جلسة جارية', `شغّل جلسة أولاً بالأمر ${code('/start')} مع الخيار ${code('remote_exec')}.`);
 
     const path = `/repos/${env.FILES_REPO}/contents/control/cmd.json`;
     let sha;
@@ -355,74 +466,100 @@ const COMMANDS = {
     });
     if (!put.ok) throw new GhError(put.status, await put.text());
 
-    await logToDiscord(env, 'warn', '🔧 /exec', [{ name: 'الأمر', value: '```\n' + cmd.slice(0, 900) + '\n```' }, { name: 'ID', value: payload.id, inline: true }]);
-    return { embeds: [embed('ok', 'تم إرسال الأمر', 'النتيجة تظهر بقناة ryder-notify خلال ثواني. (الجلسة لازم تكون مشغّلة مع remote_exec.)')] };
+    await audit(env, { command: 'exec', user: userId, ok: true, options: { id: payload.id }, detail: cmd });
+    return {
+      kind: 'ok',
+      title: '🔧 أُرسل الأمر إلى الجلسة',
+      lead: 'ستظهر النتيجة في قناة ryder-notify خلال ثوانٍ. تأكد أن الجلسة بدأت مع الخيار remote_exec.',
+      sections: [{ facts: [['معرّف الأمر', code(payload.id)], ['طول الأمر', `${cmd.length} حرفاً`]] }],
+      compact: true,
+    };
   },
 };
 
+// ------------------------------------------------------------------ buttons
+async function stopAll(i, env) {
+  const active = await activeRuns(env);
+  if (!active.length) return idleSpec(env, (await listRuns(env, 1))[0]);
+  const results = await Promise.all(
+    active.map(async (r) => {
+      const res = await gh(env, `/repos/${env.REPO}/actions/runs/${r.id}/cancel`, { method: 'POST' });
+      return `${res.status === 202 ? '✅' : '⚠️'} ${mdLink(r)} · ${res.status === 202 ? 'أُرسل أمر الإلغاء' : `تعذّر الإلغاء (HTTP ${res.status})`}`;
+    }),
+  );
+  return {
+    kind: 'ok',
+    title: '✅ أُرسل أمر الإيقاف',
+    lead: `تأكد من النتيجة بالأمر ${code('/status')} بعد لحظات.`,
+    sections: [{ heading: 'النتيجة', items: results }],
+    buttons: [button('حالة الجلسة', 'status:refresh', 2, '📡')],
+    compact: true,
+  };
+}
+
+const BUTTONS = {
+  'stop:ask': (i, env) => COMMANDS.stop(i, env),
+  'stop:all': stopAll,
+  'stop:cancel': async () => noteSpec('info', '↩️ تم التراجع', 'لم تُوقَف أي جلسة.', { buttons: [button('حالة الجلسة', 'status:refresh', 2, '📡')] }),
+  'status:refresh': (i, env) => COMMANDS.status(i, env),
+  'history:refresh': (i, env) => COMMANDS.history(i, env),
+  'start:quick': (i, env) => COMMANDS.start(i, env, {}),
+};
+
 // ------------------------------------------------------------------ interaction plumbing
-async function editOriginal(env, token, payload) {
-  const res = await fetch(`${DISCORD_API}/webhooks/${env.APP_ID}/${token}/messages/@original`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ allowed_mentions: { parse: [] }, ...payload }),
-  });
-  if (!res.ok) console.error(JSON.stringify({ level: 'error', msg: 'edit original failed', status: res.status }));
+async function editOriginal(env, token, spec) {
+  const mode = uiMode(env);
+  for (const m of mode === 'v2' ? ['v2', 'classic'] : ['classic']) {
+    const res = await fetch(`${DISCORD_API}/webhooks/${env.APP_ID}/${token}/messages/@original`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ allowed_mentions: { parse: [] }, ...render(spec, m) }),
+    });
+    if (res.ok) return true;
+    console.error(JSON.stringify({ level: 'error', msg: 'edit original failed', mode: m, status: res.status, body: (await res.text()).slice(0, 300) }));
+  }
+  return false;
 }
 
 async function execute(i, env, name, opts) {
   const t0 = Date.now();
   const user = i.member?.user?.id ?? i.user?.id;
-  let payload;
+  let spec;
   let ok = true;
   let errorId;
   try {
-    payload = await COMMANDS[name](i, env, opts);
+    spec = await COMMANDS[name](i, env, opts);
   } catch (e) {
     ok = false;
     errorId = newId();
     console.error(JSON.stringify({ level: 'error', errorId, command: name, err: String(e), body: e.body }));
-    payload = { embeds: [embed('err', 'صار خطأ', `${friendlyError(e)}\nمعرّف الخطأ: \`${errorId}\``)] };
+    spec = errorSpec(e, errorId);
   }
-  await editOriginal(env, i.token, payload);
+  await editOriginal(env, i.token, spec);
   const logged = { ...opts };
-  delete logged.command; // the /exec command text is logged separately
-  await audit(env, { command: name, user, options: logged, ok, ms: Date.now() - t0, errorId });
+  delete logged.command; // the /exec command text is never logged
+  if (name !== 'exec' || !ok) await audit(env, { command: name, user, options: logged, ok, ms: Date.now() - t0, errorId });
 }
 
 async function handleButton(i, env) {
   const user = i.member?.user?.id ?? i.user?.id;
   const id = i.data.custom_id;
   const t0 = Date.now();
-  let payload;
+  let spec;
   let ok = true;
   let errorId;
   try {
-    if (id === 'stop:cancel') {
-      payload = { embeds: [embed('info', 'تم الإلغاء', 'ما انوقفت أي جلسة.')], components: [] };
-    } else if (id === 'stop:all') {
-      const active = await activeRuns(env);
-      if (!active.length) {
-        payload = { embeds: [embed('info', 'ما فيه جلسة شغالة')], components: [] };
-      } else {
-        const results = await Promise.all(
-          active.map(async (r) => {
-            const res = await gh(env, `/repos/${env.REPO}/actions/runs/${r.id}/cancel`, { method: 'POST' });
-            return `${res.status === 202 ? '✅' : '⚠️'} #${r.run_number} (${res.status})`;
-          }),
-        );
-        payload = { embeds: [embed('ok', 'أرسلت أمر الإيقاف', results.join('\n') + '\nتأكد بـ /status بعد لحظات.')], components: [] };
-      }
-    } else {
-      payload = { embeds: [embed('warn', 'زر غير معروف')], components: [] };
-    }
+    const logsMatch = /^logs:(\d{1,3})$/.exec(id);
+    if (logsMatch) spec = await COMMANDS.logs(i, env, { lines: Number(logsMatch[1]) });
+    else if (BUTTONS[id]) spec = await BUTTONS[id](i, env);
+    else spec = noteSpec('warn', '⚠️ زر غير معروف', 'هذا الزر لم يعد مدعوماً. أعد تشغيل الأمر من جديد.');
   } catch (e) {
     ok = false;
     errorId = newId();
     console.error(JSON.stringify({ level: 'error', errorId, button: id, err: String(e) }));
-    payload = { embeds: [embed('err', 'صار خطأ', `${friendlyError(e)}\nمعرّف الخطأ: \`${errorId}\``)], components: [] };
+    spec = errorSpec(e, errorId);
   }
-  await editOriginal(env, i.token, payload);
+  await editOriginal(env, i.token, spec);
   await audit(env, { action: id, user, ok, ms: Date.now() - t0, errorId });
 }
 
@@ -432,15 +569,15 @@ async function handleInteraction(i, env, ctx) {
   const user = i.member?.user?.id ?? i.user?.id;
   if (i.guild_id !== env.GUILD_ID || user !== env.OWNER_ID) {
     ctx.waitUntil(audit(env, { command: i.data?.name, action: i.data?.custom_id, user, denied: true }));
-    return ephemeral('⛔ غير مصرّح لك باستخدام هذا البوت.');
+    return privateCard(env, noteSpec('err', '⛔ غير مصرّح لك', 'هذا البوت مخصّص لمالك الخادم فقط.', { footer: false }));
   }
 
   if (i.type === 2) {
     const name = i.data.name;
-    if (!COMMANDS[name]) return ephemeral('أمر غير معروف.');
+    if (!COMMANDS[name]) return privateCard(env, noteSpec('warn', '⚠️ أمر غير معروف', `استخدم ${code('/help')} لعرض الأوامر المتاحة.`));
     const opts = Object.fromEntries((i.data.options || []).map((o) => [o.name, o.value]));
     ctx.waitUntil(execute(i, env, name, opts));
-    return deferred();
+    return deferred(env);
   }
 
   if (i.type === 3) {
@@ -448,13 +585,37 @@ async function handleInteraction(i, env, ctx) {
     return deferredUpdate();
   }
 
-  return ephemeral('نوع تفاعل غير مدعوم.');
+  return privateCard(env, noteSpec('warn', '⚠️ نوع تفاعل غير مدعوم', 'لا يدعم البوت هذا النوع من التفاعلات.'));
+}
+
+// ------------------------------------------------------------------ session events from main.yml
+async function handleEvent(request, env) {
+  const raw = await request.text();
+  if (raw.length > 20000) return json({ ok: false, error: 'too large' }, 413);
+  const secret = (env.DISCORD_NOTIFY_WEBHOOK || '').trim();
+  if (!secret) return json({ ok: false, error: 'notify webhook is not configured on the Worker' }, 503);
+  if (!(await verifyHmac(secret, request.headers.get('x-ryder-ts'), raw, request.headers.get('x-ryder-sig')))) return json({ ok: false, error: 'bad signature' }, 401);
+
+  let evt;
+  try {
+    evt = JSON.parse(raw);
+  } catch {
+    return json({ ok: false, error: 'bad json' }, 400);
+  }
+  const spec = eventSpec(evt?.type, evt, Date.now());
+  if (!spec) return json({ ok: false, error: 'unknown event' }, 400);
+
+  const r = await postWebhook(secret, spec, { mode: uiMode(env), username: 'Ryder' });
+  console.log(JSON.stringify({ ts: new Date().toISOString(), event: evt.type, via: r.via, status: r.status }));
+  return json({ ok: r.ok, via: r.via }, r.ok ? 200 : 502);
 }
 
 export default {
   async fetch(request, env, ctx) {
     if (request.method === 'GET') return new Response('ryder-bot ok', { status: 200 });
     if (request.method !== 'POST') return new Response('method not allowed', { status: 405 });
+    if (new URL(request.url).pathname === '/event') return handleEvent(request, env);
+
     const body = await request.text();
     if (!(await verifySignature(request, body, env.DISCORD_PUBLIC_KEY))) return new Response('bad signature', { status: 401 });
     let interaction;
