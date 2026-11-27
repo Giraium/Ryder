@@ -5,7 +5,9 @@ name: Deploy Ryder Bot
 #
 # Repository secrets (Settings > Secrets and variables > Actions):
 #   CF_API_TOKEN, CF_ACCOUNT_ID, DISCORD_BOT_TOKEN, GH_BOT_PAT, FILES_PAT
-#   DISCORD_LOG_WEBHOOK  (optional: the bot simply skips logging without it)
+#   DISCORD_LOG_WEBHOOK     (optional: the bot simply skips the audit log without it)
+#   DISCORD_NOTIFY_WEBHOOK  (optional but recommended: lets the bot render the session messages in ryder-notify;
+#                            without it, main.yml falls back to plain embeds)
 #
 # Every secret is sanitized before use (spaces, newlines and hidden characters
 # removed), so a stray Enter when pasting a secret can no longer break the run.
@@ -120,6 +122,7 @@ jobs:
           GH_BOT_PAT: ${{ secrets.GH_BOT_PAT }}
           FILES_PAT: ${{ secrets.FILES_PAT }}
           DISCORD_LOG_WEBHOOK: ${{ secrets.DISCORD_LOG_WEBHOOK }}
+          DISCORD_NOTIFY_WEBHOOK: ${{ secrets.DISCORD_NOTIFY_WEBHOOK }}
         run: |
           . "$RUNNER_TEMP/lib.sh"
           CLOUDFLARE_API_TOKEN="$(need CF_API_TOKEN "$CF_API_TOKEN" 'A-Za-z0-9_-')"
@@ -129,14 +132,17 @@ jobs:
           gh_pat="$(need GH_BOT_PAT "$GH_BOT_PAT")"
           files_pat="$(need FILES_PAT "$FILES_PAT")"
           log_hook="$(opt DISCORD_LOG_WEBHOOK "$DISCORD_LOG_WEBHOOK")"
+          notify_hook="$(opt DISCORD_NOTIFY_WEBHOOK "$DISCORD_NOTIFY_WEBHOOK")"
 
           # Keep the secrets file outside the repo, readable only by us, and
           # delete it even if wrangler fails.
           secrets_file="$RUNNER_TEMP/worker-secrets.json"
           trap 'rm -f "$secrets_file"' EXIT
           umask 077
-          jq -n --arg gh "$gh_pat" --arg files "$files_pat" --arg hook "$log_hook" \
-            '{GH_BOT_PAT: $gh, FILES_PAT: $files} + (if $hook != "" then {DISCORD_LOG_WEBHOOK: $hook} else {} end)' \
+          jq -n --arg gh "$gh_pat" --arg files "$files_pat" --arg hook "$log_hook" --arg notify "$notify_hook" \
+            '{GH_BOT_PAT: $gh, FILES_PAT: $files}
+             + (if $hook != "" then {DISCORD_LOG_WEBHOOK: $hook} else {} end)
+             + (if $notify != "" then {DISCORD_NOTIFY_WEBHOOK: $notify} else {} end)' \
             > "$secrets_file"
 
           npx --yes wrangler@4 secret bulk "$secrets_file"

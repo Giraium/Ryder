@@ -61,6 +61,8 @@ permissions: {}
 
 env:
   FILES_REPO: Giraium/Ryder-files
+  # The bot (Cloudflare Worker) that renders the Discord messages. If it is unreachable, plain embeds are sent instead.
+  RYDER_BOT_URL: https://ryder-bot.yamafhh5-network.workers.dev
 
 defaults:
   run:
@@ -264,6 +266,49 @@ jobs:
             catch { Write-Host "[notify] failed: $($_.Exception.Message)" }
           }
 
+          # ---------- Rich Discord messages ----------
+          # The event is signed (HMAC) and sent to the bot, which renders it (Components V2) and posts it to ryder-notify.
+          # If the bot cannot be reached, a plain embed is sent directly so a notification is never lost.
+          function Send-Event {
+            param(
+              [Parameter(Mandatory)][string]$Type,
+              [hashtable]$Data = @{}
+            )
+            if ([string]::IsNullOrWhiteSpace($env:DISCORD_NOTIFY_WEBHOOK)) { return }
+            $Data['type'] = $Type
+            if (-not $Data.ContainsKey('runUrl')) { $Data['runUrl'] = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" }
+            if (-not $Data.ContainsKey('runNumber')) { $Data['runNumber'] = [string]$env:GITHUB_RUN_NUMBER }
+
+            $sent = $false
+            if (-not [string]::IsNullOrWhiteSpace($env:RYDER_BOT_URL)) {
+              try {
+                $json  = $Data | ConvertTo-Json -Depth 4 -Compress
+                $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
+                $mac   = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($env:DISCORD_NOTIFY_WEBHOOK.Trim()))
+                $sig   = ($mac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$stamp.$json")) | ForEach-Object { $_.ToString('x2') }) -join ''
+                Invoke-RestMethod -Uri ($env:RYDER_BOT_URL.TrimEnd('/') + '/event') -Method Post `
+                  -ContentType 'application/json; charset=utf-8' `
+                  -Headers @{ 'X-Ryder-Ts' = $stamp; 'X-Ryder-Sig' = $sig } `
+                  -Body ([System.Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 20 | Out-Null
+                $sent = $true
+              }
+              catch { Write-Host "[notify] bot endpoint failed ($($_.Exception.Message)) - sending a plain message instead" }
+            }
+
+            if (-not $sent) {
+              $titles = @{
+                preparing = '⏳ بدأ تجهيز الجلسة'; ready = '🟢 الجلسة جاهزة'; time_warning = '⏰ الجلسة توشك على الانتهاء'
+                renew_started = '🔁 جلسة جديدة قيد التجهيز'; renew_limit = '⚠️ وصلنا حد التجديد'; renew_failed = '❌ فشل التجديد التلقائي'
+                backup_failed = '⚠️ فشل حفظ Work'; exec_started = '🔧 تنفيذ أمر'; exec_result = '✅ نتيجة الأمر'; ended = '🔴 انتهت الجلسة'
+              }
+              $kinds = @{ ready = 'ok'; exec_result = 'ok'; time_warning = 'warn'; renew_limit = 'warn'; backup_failed = 'warn'; ended = 'warn'; renew_failed = 'err' }
+              $kind  = if ($kinds.ContainsKey($Type)) { $kinds[$Type] } else { 'info' }
+              $title = if ($titles.ContainsKey($Type)) { $titles[$Type] } else { $Type }
+              $lines = @($Data.GetEnumerator() | Where-Object { $_.Key -ne 'type' -and "$($_.Value)" -ne '' } | Sort-Object Key | ForEach-Object { "$($_.Key): $($_.Value)" })
+              Send-Notify -Title $title -Kind $kind -Description ($lines -join "`n")
+            }
+          }
+
           # ---------- GitHub CLI against the private files repo ----------
           function Invoke-GhFiles {
             # Uses FILES_PAT only for this one call, then puts the previous token back
@@ -412,4 +457,680 @@ jobs:
           }
 
           function New-Shortcut([string]$Path, [string]$Target, [string]$Arguments = '', [string]$Icon = '') {
-            $w = New-Object -ComObject 
+            $w = New-Object -ComObject WScript.Shell
+            $s = $w.CreateShortcut($Path)
+            $s.TargetPath = $Target
+            if ($Arguments) { $s.Arguments = $Arguments }
+            if ($Icon) { $s.IconLocation = $Icon }
+            $s.Save()
+          }
+
+          function Add-MachinePath([string]$Dir) {
+            $cur = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+            if (($cur -split ';') -notcontains $Dir) {
+              [Environment]::SetEnvironmentVariable('Path', "$Dir;$cur", 'Machine')
+            }
+          }
+
+          $desktop = 'C:\Users\Public\Desktop'
+          New-Item -ItemType Directory -Path 'C:\Tools', 'C:\Work' -Force | Out-Null
+
+          # ---- 1) Brave (machine-wide, official offline installer, signature checked) ----
+          Invoke-Section 'Brave' {
+            $f = Join-Path $env:TEMP 'BraveSetup.exe'
+            try {
+              Get-Signed 'https://github.com/brave/brave-browser/releases/latest/download/BraveBrowserStandaloneSetup.exe' $f 'Brave'
+            }
+            catch {
+              Write-Host "Primary Brave source failed ($($_.Exception.Message)) - trying brave.com"
+              Get-Signed 'https://laptop-updates.brave.com/latest/winx64' $f 'Brave'
+            }
+            $p = Start-Process -FilePath $f -ArgumentList '/silent', '/install' -Wait -PassThru
+            Write-Host "Brave installer exit code: $($p.ExitCode)"
+            Remove-Item $f -Force -ErrorAction SilentlyContinue
+            $exe = "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe"
+            if (-not (Test-Path $exe)) { throw "brave.exe not found after install" }
+            New-Shortcut "$desktop\Brave.lnk" $exe
+          }
+
+          # ---- 2) Brave = default browser for every NEW user (the RDP user is created fresh) ----
+          Invoke-Section 'Default browser' {
+            $xmlPath = "$env:ProgramData\default-apps.xml"
+            $xml = @(
+              '<?xml version="1.0" encoding="UTF-8"?>',
+              '<DefaultAssociations>',
+              '  <Association Identifier="http"  ProgId="BraveHTML" ApplicationName="Brave" />',
+              '  <Association Identifier="https" ProgId="BraveHTML" ApplicationName="Brave" />',
+              '  <Association Identifier=".htm"  ProgId="BraveHTML" ApplicationName="Brave" />',
+              '  <Association Identifier=".html" ProgId="BraveHTML" ApplicationName="Brave" />',
+              '</DefaultAssociations>'
+            ) -join "`n"
+            Set-Content -Path $xmlPath -Value $xml -Encoding UTF8
+            dism.exe /Online /Import-DefaultAppAssociations:"$xmlPath" | Out-Null
+            $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+            if (-not (Test-Path $pol)) { New-Item -Path $pol -Force | Out-Null }
+            Set-ItemProperty -Path $pol -Name 'DefaultAssociationsConfiguration' -Value $xmlPath -Type String -Force
+          }
+
+          # ---- 3) Remove Edge (best effort) and stop it coming back ----
+          Invoke-Section 'Remove Edge' {
+            $base = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application"
+            $setup = Get-ChildItem -Path $base -Filter 'setup.exe' -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\Installer\\setup\.exe$' } |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if ($setup) {
+              $p = Start-Process -FilePath $setup.FullName -Wait -PassThru `
+                -ArgumentList '--uninstall', '--system-level', '--verbose-logging', '--force-uninstall'
+              Write-Host "Edge uninstall exit code: $($p.ExitCode)"
+            } else {
+              Write-Host "Edge installer not found (already removed?)"
+            }
+            $eu = 'HKLM:\SOFTWARE\Microsoft\EdgeUpdate'
+            if (-not (Test-Path $eu)) { New-Item -Path $eu -Force | Out-Null }
+            Set-ItemProperty -Path $eu -Name 'DoNotUpdateToEdgeWithChromium' -Value 1 -Type DWord -Force
+            foreach ($svc in 'edgeupdate', 'edgeupdatem', 'MicrosoftEdgeElevationService') {
+              Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+              Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+            }
+            Get-ScheduledTask -TaskName 'MicrosoftEdgeUpdate*' -ErrorAction SilentlyContinue |
+              Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item "$desktop\Microsoft Edge.lnk" -Force -ErrorAction SilentlyContinue
+            if (Test-Path "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe") {
+              Write-Host "NOTE: Edge is still present (Windows may protect it). Brave is the default anyway."
+            }
+          }
+
+          # ---- 4) Windows Terminal (portable build from Microsoft's GitHub release) ----
+          Invoke-Section 'Windows Terminal' {
+            $hdr = @{ 'User-Agent' = 'ryder-workflow'; 'Accept' = 'application/vnd.github+json' }
+            $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/terminal/releases/latest' -Headers $hdr
+            $asset = $rel.assets | Where-Object { $_.name -match '^Microsoft\.WindowsTerminal_.+_x64\.zip$' } | Select-Object -First 1
+            if (-not $asset) { throw "x64 zip asset not found in the latest release" }
+            $zip = Join-Path $env:TEMP 'wt.zip'
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -UseBasicParsing
+            $dest = 'C:\Tools\WindowsTerminal'
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            Expand-Archive -Path $zip -DestinationPath $dest -Force
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            $wt = Get-ChildItem -Path $dest -Recurse -Filter 'wt.exe' | Select-Object -First 1
+            if (-not $wt) { throw "wt.exe not found after extraction" }
+            $sig = Get-AuthenticodeSignature $wt.FullName
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') {
+              throw "Windows Terminal signature check failed (status=$($sig.Status))"
+            }
+            $root = $wt.DirectoryName
+            # Portable mode: settings live next to the exe, default profile = PowerShell 7
+            New-Item -ItemType File -Path (Join-Path $root '.portable') -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $root 'settings') -Force | Out-Null
+            $cfg = '{ "$schema": "https://aka.ms/terminal-profiles-schema", "defaultProfile": "{574e775e-4f2a-5b96-ac1e-a2962a402336}", "copyOnSelect": true }'
+            Set-Content -Path (Join-Path $root 'settings\settings.json') -Value $cfg -Encoding UTF8
+            Add-MachinePath $root
+            New-Shortcut "$desktop\Terminal.lnk" $wt.FullName
+          }
+
+          # ---- 5) Visual Studio 2022 (already on the runner image) + optional VS Code ----
+          Invoke-Section 'Visual Studio' {
+            $vs = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022\*\Common7\IDE\devenv.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $vs) { throw "devenv.exe not found on this image" }
+            New-Shortcut "$desktop\Visual Studio 2022.lnk" $vs.FullName
+          }
+
+          if ($env:INSTALL_VSCODE -eq 'true') {
+            Invoke-Section 'VS Code' {
+              $f = Join-Path $env:TEMP 'vscode-setup.exe'
+              Get-Signed 'https://update.code.visualstudio.com/latest/win32-x64/stable' $f 'Microsoft'
+              $p = Start-Process -FilePath $f -Wait -PassThru -ArgumentList '/VERYSILENT', '/NORESTART', '/SUPPRESSMSGBOXES', '/MERGETASKS=!runcode,desktopicon,addtopath'
+              Write-Host "VS Code installer exit code: $($p.ExitCode)"
+              Remove-Item $f -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # ---- 5b) What happens when the RDP user logs in: Brave + Discord open, Drop files copied to Downloads ----
+          Invoke-Section 'Startup apps (Brave + Discord + Drop folder)' {
+            $startupAll = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp'
+            New-Item -ItemType Directory -Path $startupAll, 'C:\ProgramData\ryder', 'C:\Drop', 'C:\Work', 'C:\Outbox' -Force | Out-Null
+
+            # Handy desktop shortcuts to the three synced folders
+            New-Shortcut "$desktop\Drop.lnk"   'C:\Drop'
+            New-Shortcut "$desktop\Work.lnk"   'C:\Work'
+            New-Shortcut "$desktop\Outbox.lnk" 'C:\Outbox'
+
+            # Brave opens at logon
+            $brave = "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe"
+            if (Test-Path $brave) { New-Shortcut "$startupAll\Brave.lnk" $brave }
+            else { Write-Host "Brave not found - not added to startup" }
+
+            # Logon script, part 1: copy everything from C:\Drop into the user's Downloads folder
+            $dropPs1 = @'
+          $dl = Join-Path $env:USERPROFILE 'Downloads'
+          New-Item -ItemType Directory -Path $dl -Force | Out-Null
+          if (Test-Path 'C:\Drop') { robocopy 'C:\Drop' $dl /E /XO /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null }
+          '@
+
+            # Logon script, part 2: Discord installs per user, so it is installed (once) and opened here
+            $discordPs1 = ''
+            if ($env:INSTALL_DISCORD -eq 'true') {
+              $dl = "$env:ProgramData\DiscordSetup.exe"
+              try { Get-Signed 'https://discord.com/api/download?platform=win' $dl 'Discord' }
+              catch { Write-Host "Discord pre-download failed ($($_.Exception.Message)) - it will be downloaded at logon" }
+              $discordPs1 = @'
+          $ProgressPreference = 'SilentlyContinue'
+          $update = Join-Path $env:LOCALAPPDATA 'Discord\Update.exe'
+          if (-not (Test-Path $update)) {
+            $setup = Join-Path $env:ProgramData 'DiscordSetup.exe'
+            if (-not (Test-Path $setup)) {
+              try { Invoke-WebRequest -Uri 'https://discord.com/api/download?platform=win' -OutFile $setup -UseBasicParsing } catch {}
+            }
+            if (Test-Path $setup) {
+              $sig = Get-AuthenticodeSignature $setup
+              if ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'Discord') {
+                Start-Process -FilePath $setup -ArgumentList '-s' -Wait
+              }
+            }
+          }
+          for ($i = 0; $i -lt 60 -and -not (Test-Path $update); $i++) { Start-Sleep -Seconds 2 }
+          if (Test-Path $update) { Start-Process -FilePath $update -ArgumentList '--processStart', 'Discord.exe' }
+          '@
+            }
+
+            Set-Content -Path 'C:\ProgramData\ryder\logon.ps1' -Value ($dropPs1 + "`r`n" + $discordPs1) -Encoding UTF8
+            $cmd = '@echo off' + "`r`n" + 'powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\ProgramData\ryder\logon.ps1"'
+            Set-Content -Path "$startupAll\start-ryder.cmd" -Value $cmd -Encoding ASCII
+          }
+
+          # ---- 6) Languages / runtimes: use what the image already ships, make Java 21 the default ----
+          Invoke-Section 'Dev environment' {
+            foreach ($v in 25, 21, 17) {
+              $jdk = [Environment]::GetEnvironmentVariable("JAVA_HOME_${v}_X64", 'Process')
+              if ($jdk -and (Test-Path "$jdk\bin\java.exe")) {
+                [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdk, 'Machine')
+                Add-MachinePath "$jdk\bin"
+                Write-Host "JAVA_HOME -> $jdk"
+                break
+              }
+            }
+            $tools = @(
+              @('python', '--version'), @('pip', '--version'), @('node', '--version'), @('npm', '--version'),
+              @('go', 'version'), @('java', '-version'), @('dotnet', '--version'), @('rustc', '--version'),
+              @('cargo', '--version'), @('php', '-v'), @('ruby', '--version'), @('git', '--version'),
+              @('gh', '--version'), @('pwsh', '-v'), @('choco', '--version')
+            )
+            foreach ($t in $tools) {
+              if (Get-Command $t[0] -ErrorAction SilentlyContinue) {
+                $line = (& $t[0] $t[1] 2>&1 | Select-Object -First 1) | Out-String
+                Write-Host ("{0,-8} {1}" -f $t[0], $line.Trim())
+              } else {
+                Write-Host ("{0,-8} NOT FOUND" -f $t[0])
+              }
+            }
+          }
+
+          # ---- 7) Preset + extra tools (Chocolatey). Edit the lists below to taste. ----
+          # Only use security tools on systems you own or are explicitly authorised to test.
+          $presets = @{
+            'minimal'      = @()
+            'dev'          = @('7zip', 'jq', 'ripgrep')
+            'security-lab' = @('7zip', 'nmap', 'sysinternals', 'ghidra', 'trivy', 'gitleaks', 'zap', 'x64dbg.portable', 'mitmproxy')
+          }
+          $wanted = @()
+          if ($presets.ContainsKey($env:PRESET)) { $wanted += $presets[$env:PRESET] }
+          if (-not [string]::IsNullOrWhiteSpace($env:EXTRA_TOOLS)) { $wanted += ($env:EXTRA_TOOLS -split '[,\s]+' | Where-Object { $_ }) }
+          $wanted = @($wanted | Select-Object -Unique)
+
+          if ($wanted.Count -gt 0) {
+            Invoke-Section "Tools ($($wanted -join ', '))" {
+              foreach ($pkg in $wanted) {
+                if ($pkg -notmatch '^[a-z0-9][a-z0-9.\-]*$') { Write-Host "skipping invalid package name: $pkg"; continue }
+                Write-Host "choco install $pkg"
+                choco install $pkg -y --no-progress --limit-output
+                Write-Host "exit code: $LASTEXITCODE"
+              }
+              if ($env:PRESET -eq 'security-lab') {
+                Write-Host "pip: bandit, pip-audit"
+                python -m pip install --quiet bandit pip-audit
+                Write-Host "sqlmap: git clone -> C:\Tools\sqlmap (command: sqlmap)"
+                git clone --depth 1 --quiet https://github.com/sqlmapproject/sqlmap C:\Tools\sqlmap 2>&1 | Out-Host
+                Set-Content -Path 'C:\Tools\sqlmap.cmd' -Value '@python "C:\Tools\sqlmap\sqlmap.py" %*' -Encoding ASCII
+                Add-MachinePath 'C:\Tools'
+              }
+            }
+          }
+
+          # ---- 8) Taskbar of the RDP user: Settings, Files, Brave, Discord (pinned, in this order). Chrome is not pinned. ----
+          Invoke-Section 'Taskbar' {
+            $progs = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs'
+            New-Item -ItemType Directory -Path $progs -Force | Out-Null
+
+            # Every pinned desktop app needs a shortcut we know exists
+            if (-not (Test-Path "$progs\File Explorer.lnk")) { New-Shortcut "$progs\File Explorer.lnk" "$env:WINDIR\explorer.exe" }
+            if (-not (Test-Path "$progs\Brave.lnk")) { New-Shortcut "$progs\Brave.lnk" "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe" }
+            # Discord installs per user at first logon (user "RDP"); this shortcut already points to where it will be
+            $discordExe = 'C:\Users\RDP\AppData\Local\Discord\Update.exe'
+            New-Shortcut "$progs\Discord.lnk" $discordExe '--processStart Discord.exe' "$discordExe,0"
+
+            $xml = @(
+              '<?xml version="1.0" encoding="utf-8"?>',
+              '<LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">',
+              '  <CustomTaskbarLayoutCollection PinListPlacement="Replace">',
+              '    <defaultlayout:TaskbarLayout>',
+              '      <taskbar:TaskbarPinList>',
+              '        <taskbar:UWA AppUserModelID="windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel" />',
+              '        <taskbar:DesktopApp DesktopApplicationLinkPath="%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\File Explorer.lnk" />',
+              '        <taskbar:DesktopApp DesktopApplicationLinkPath="%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Brave.lnk" />',
+              '        <taskbar:DesktopApp DesktopApplicationLinkPath="%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Discord.lnk" />',
+              '      </taskbar:TaskbarPinList>',
+              '    </defaultlayout:TaskbarLayout>',
+              '  </CustomTaskbarLayoutCollection>',
+              '</LayoutModificationTemplate>'
+            ) -join "`r`n"
+            $shellDir = 'C:\Users\Default\AppData\Local\Microsoft\Windows\Shell'
+            New-Item -ItemType Directory -Path $shellDir -Force | Out-Null
+            Set-Content -Path "$shellDir\LayoutModification.xml" -Value $xml -Encoding UTF8
+
+            # Drop any Chrome pin the image may leave in the default profile
+            Remove-Item 'C:\Users\Default\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\*Chrome*.lnk' -Force -ErrorAction SilentlyContinue
+          }
+
+          # ---- 9) Desktop: only Brave, Terminal, VS Code, Drop, Work, Outbox (Discord adds its own shortcut at logon) ----
+          Invoke-Section 'Clean desktop' {
+            $keep = @('Brave', 'Terminal', 'Visual Studio Code', 'Drop', 'Work', 'Outbox')
+            foreach ($dir in $desktop, 'C:\Users\Default\Desktop') {
+              Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -in '.lnk', '.url' -and $keep -notcontains $_.BaseName } |
+                ForEach-Object { Write-Host "removing: $($_.FullName)"; Remove-Item $_.FullName -Force }
+            }
+          }
+
+      - name: Restore files (Drop + Work)
+        env:
+          PRESET: ${{ inputs.preset }}
+          RENEW_COUNT: ${{ inputs.renew_count }}
+          FILES_PAT: ${{ secrets.FILES_PAT }}
+          DISCORD_NOTIFY_WEBHOOK: ${{ secrets.DISCORD_NOTIFY_WEBHOOK }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          . 'C:\ProgramData\ryder\lib.ps1'
+
+          $runUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $rc = 0; [void][int]::TryParse($env:RENEW_COUNT, [ref]$rc)
+          Send-Event 'preparing' @{ preset = $env:PRESET; renewCount = $rc; runUrl = $runUrl }
+
+          if ([string]::IsNullOrWhiteSpace($env:FILES_PAT)) {
+            Write-Host "FILES_PAT is not set - skipping file restore (folders are still created)."
+            New-Item -ItemType Directory -Path 'C:\Drop', 'C:\Work', 'C:\Outbox' -Force | Out-Null
+            exit 0
+          }
+
+          $info = Restore-State
+          Write-Host ("Drop files: {0} | Work: {1}" -f $info.drop_release, $info.work)
+          try {
+            [pscustomobject]@{ drop = [int]$info.drop_release; work = [string]$info.work } |
+              ConvertTo-Json -Compress | Set-Content -Path 'C:\ProgramData\ryder\restore.json' -Encoding UTF8
+          } catch { Write-Host "restore summary not saved: $($_.Exception.Message)" }
+          # Missing "drop"/"work" releases are expected on the first run and leave
+          # $LASTEXITCODE = 1; Actions would turn that into a failed step. Reset it.
+          $global:LASTEXITCODE = 0
+
+      - name: Install Tailscale
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          # Newest stable MSI for Windows (falls back to the "latest" alias)
+          $ver = $null
+          try { $ver = (Invoke-RestMethod -Uri 'https://pkgs.tailscale.com/stable/?mode=json&os=windows').Version } catch {}
+          $tsUrl = if ($ver) { "https://pkgs.tailscale.com/stable/tailscale-setup-$ver-amd64.msi" }
+                   else { 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' }
+          Write-Host "Downloading $tsUrl"
+
+          for ($i = 1; $i -le 3; $i++) {
+            try { Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing; break }
+            catch { if ($i -eq 3) { throw }; Start-Sleep -Seconds 3 }
+          }
+
+          # Make sure the installer is really signed by Tailscale
+          $sig = Get-AuthenticodeSignature $installerPath
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Tailscale') {
+            Write-Error "Tailscale installer signature check failed."
+            exit 1
+          }
+
+          Start-Process msiexec.exe -ArgumentList '/i', "`"$installerPath`"", '/quiet', '/norestart' -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          # Never fall back to a manual login link: in a public repo the log is visible to everyone
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            Write-Error "Secret TAILSCALE_AUTHKEY is missing in this repository - stopping."
+            exit 1
+          }
+
+          # Up to 3 attempts: a transient network hiccup should not kill the whole run
+          $ok = $false
+          for ($i = 1; $i -le 3 -and -not $ok; $i++) {
+            & $ts up --authkey=$env:TS_AUTHKEY --hostname=ryder `
+              --unattended --accept-dns=false --accept-routes=false --timeout=60s
+            if ($LASTEXITCODE -eq 0) { $ok = $true } else { Write-Host "tailscale up failed (attempt $i)"; Start-Sleep -Seconds 5 }
+          }
+          if (-not $ok) { Write-Error "tailscale up failed after 3 attempts"; exit 1 }
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if (-not $tsIP) { Start-Sleep -Seconds 5 }
+            $retries++
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned. Exiting."
+            exit 1
+          }
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "TCP connection to RDP port 3389 failed"
+            exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+          Write-Host "--- Tailscale network check (UDP / nearest relay) ---"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" netcheck
+
+      - name: Announce ready
+        env:
+          PRESET: ${{ inputs.preset }}
+          AUTO_RENEW: ${{ inputs.auto_renew }}
+          MAX_RENEWALS: ${{ inputs.max_renewals }}
+          RENEW_COUNT: ${{ inputs.renew_count }}
+          DISCORD_NOTIFY_WEBHOOK: ${{ secrets.DISCORD_NOTIFY_WEBHOOK }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          . 'C:\ProgramData\ryder\lib.ps1'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          $dns = $env:TAILSCALE_IP
+          try {
+            $self = (& $ts status --json | ConvertFrom-Json).Self
+            if ($self.DNSName) { $dns = $self.DNSName.TrimEnd('.') }
+          } catch {}
+
+          $data = @{
+            name         = $dns
+            ip           = $env:TAILSCALE_IP
+            user         = 'RDP'
+            passwordMode = $(if ($env:SERVE_PASSWORD -eq 'true') { 'page' } else { 'secret' })
+            passwordUrl  = "http://$($env:TAILSCALE_IP):8080/"
+            startedAt    = ([long]$env:JOB_START) * 1000
+            preset       = $env:PRESET
+            autoRenew    = ($env:AUTO_RENEW -eq 'true')
+            renewCount   = $env:RENEW_COUNT
+            maxRenewals  = $env:MAX_RENEWALS
+          }
+          try {
+            $summary = 'C:\ProgramData\ryder\restore.json'
+            if (Test-Path $summary) {
+              $rs = Get-Content $summary -Raw | ConvertFrom-Json
+              $data['dropFiles'] = [int]$rs.drop
+              $data['work'] = [string]$rs.work
+            }
+          } catch { Write-Host "restore summary not read: $($_.Exception.Message)" }
+          Send-Event 'ready' $data
+          Write-Host "Ready announcement sent."
+
+      - name: Maintain Connection + Watchdog
+        env:
+          PRESET: ${{ inputs.preset }}
+          INSTALL_VSCODE: ${{ inputs.install_vscode }}
+          INSTALL_DISCORD: ${{ inputs.install_discord }}
+          EXTRA_TOOLS: ${{ inputs.extra_tools }}
+          AUTO_RENEW: ${{ inputs.auto_renew }}
+          MAX_RENEWALS: ${{ inputs.max_renewals }}
+          RENEW_COUNT: ${{ inputs.renew_count }}
+          REMOTE_EXEC: ${{ inputs.remote_exec }}
+          FILES_PAT: ${{ secrets.FILES_PAT }}
+          DISCORD_NOTIFY_WEBHOOK: ${{ secrets.DISCORD_NOTIFY_WEBHOOK }}
+          RENEW_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          . 'C:\ProgramData\ryder\lib.ps1'
+
+          $ts       = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $limit    = 355   # minutes - keep equal to timeout-minutes
+          $jobStart = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START)
+          $jobStartUtc = $jobStart.UtcDateTime
+          $sessionStartMs = $jobStart.ToUnixTimeMilliseconds()
+          $hasFiles = -not [string]::IsNullOrWhiteSpace($env:FILES_PAT)
+
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address:  $env:TAILSCALE_IP   (or the name: ryder)"
+          Write-Host "Username: RDP"
+
+          # ---------- password page (only when no RDP_PASSWORD secret was given) ----------
+          function Start-PasswordPage {
+            $url = "http://$($env:TAILSCALE_IP):8080/"
+            $global:pwJob = Start-Job -ArgumentList $url, $env:RDP_PASSWORD -ScriptBlock {
+              param($url, $pw)
+              $listener = New-Object System.Net.HttpListener
+              $listener.Prefixes.Add($url)
+              $listener.Start()
+              while ($listener.IsListening) {
+                $ctx = $listener.GetContext()
+                $body = [System.Text.Encoding]::UTF8.GetBytes("Username: RDP`nPassword: $pw`n")
+                $ctx.Response.ContentType = 'text/plain'
+                $ctx.Response.OutputStream.Write($body, 0, $body.Length)
+                $ctx.Response.Close()
+              }
+            }
+          }
+          if ($env:SERVE_PASSWORD -eq 'true') {
+            Start-PasswordPage
+            Write-Host "Password: open http://$($env:TAILSCALE_IP):8080/ from a device on your Tailscale network"
+          }
+          else { Write-Host "Password: your RDP_PASSWORD secret" }
+          Write-Host "==================`n"
+
+          # ---------- auto-renew: start a fresh session before GitHub's 6-hour limit ----------
+          function Start-Renewal {
+            # returns 'ok', 'limit' or 'fail'
+            $count = 0; [void][int]::TryParse($env:RENEW_COUNT, [ref]$count)
+            $max   = 0; [void][int]::TryParse($env:MAX_RENEWALS, [ref]$max)   # 0 = unlimited
+            if ($max -gt 0 -and $count -ge $max) {
+              Send-Event 'renew_limit' @{ count = $count; max = $max }
+              return 'limit'
+            }
+
+            # Save C:\Work first so the new session restores the latest state
+            if ($script:allowWork -and $hasFiles) {
+              try { Write-Host ("Work backup before renewal: " + (Backup-Work)) }
+              catch { Write-Host "Work backup before renewal failed: $($_.Exception.Message)" }
+            }
+
+            $wf = ($env:GITHUB_WORKFLOW_REF -split '@')[0] -replace '^.*/\.github/workflows/', ''
+            $old = $env:GH_TOKEN
+            $env:GH_TOKEN = $env:RENEW_TOKEN
+            try {
+              & gh workflow run $wf --repo $env:GITHUB_REPOSITORY --ref $env:GITHUB_REF_NAME `
+                -f "preset=$env:PRESET" `
+                -f "install_vscode=$env:INSTALL_VSCODE" `
+                -f "install_discord=$env:INSTALL_DISCORD" `
+                -f "extra_tools=$env:EXTRA_TOOLS" `
+                -f "auto_renew=true" `
+                -f "max_renewals=$max" `
+                -f "renew_count=$($count + 1)" `
+                -f "remote_exec=$env:REMOTE_EXEC" 2>&1 | Out-Host
+              $code = $LASTEXITCODE
+            }
+            finally { $env:GH_TOKEN = $old }
+
+            if ($code -ne 0) { return 'fail' }
+
+            New-Item -ItemType File -Path 'C:\ProgramData\ryder\renewed.flag' -Force | Out-Null
+            $script:allowWork = $false
+            Send-Event 'renew_started' @{ next = ($count + 1); max = $max }
+            return 'ok'
+          }
+
+          # ---------- remote exec (only when REMOTE_EXEC=true; commands come from the bot's /exec) ----------
+          $script:lastCmdId = $null
+          function Invoke-RemoteExec {
+            $resp = Invoke-GhFiles api "repos/$($env:FILES_REPO)/contents/control/cmd.json"
+            if ($LASTEXITCODE -ne 0 -or -not $resp) { return }
+            $meta = ($resp | Out-String) | ConvertFrom-Json
+            if (-not $meta.content) { return }
+            $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($meta.content -replace '\s', '')))
+            $cmd = $json | ConvertFrom-Json
+            if (-not $cmd.id -or $cmd.id -eq $script:lastCmdId) { return }
+            $script:lastCmdId = $cmd.id
+            if ([long]$cmd.ts -lt $sessionStartMs) { return }   # old command from a previous session
+
+            Write-Host "[exec] running command $($cmd.id)"
+            Send-Event 'exec_started' @{ command = [string]$cmd.cmd }
+
+            $job = Start-Job -ArgumentList $cmd.cmd -ScriptBlock {
+              param($c)
+              $ErrorActionPreference = 'Continue'
+              & ([scriptblock]::Create($c)) 2>&1 | Out-String -Width 200
+            }
+            $timedOut = $false
+            if (Wait-Job $job -Timeout 120) { $out = Receive-Job $job }
+            else { Stop-Job $job; $out = 'timeout after 120 seconds'; $timedOut = $true }
+            Remove-Job $job -Force -ErrorAction SilentlyContinue
+
+            $out = ([string]$out).Trim()
+            if ($out.Length -gt 1500) { $out = $out.Substring($out.Length - 1500) }
+            if (-not $out) { $out = '(no output)' }
+            Send-Event 'exec_result' @{ output = $out; timedOut = $timedOut }
+          }
+
+          # ---------- main loop ----------
+          $script:allowWork = $true
+          $renewState = 'pending'    # pending | ok | limit | gaveup
+          $renewTries = 0
+          $finalDone = $false
+          $warned = @{}
+          $tick = 0
+
+          while ($true) {
+            Start-Sleep -Seconds 15
+            $tick++
+            $left = [int]($limit - ((Get-Date).ToUniversalTime() - $jobStartUtc).TotalMinutes)
+
+            # health checks every 30 s: bring back anything that stopped
+            if ($tick % 2 -eq 0) {
+              try {
+                if ((Get-Service -Name TermService).Status -ne 'Running') {
+                  Write-Host "[watchdog] TermService stopped - starting it"
+                  Start-Service -Name TermService
+                }
+                & $ts status *> $null
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "[watchdog] Tailscale not healthy - restarting the service"
+                  Restart-Service -Name Tailscale -Force
+                  Start-Sleep -Seconds 10
+                }
+                if ($env:SERVE_PASSWORD -eq 'true' -and $global:pwJob.State -ne 'Running') {
+                  Write-Host "[watchdog] password page stopped - restarting it"
+                  Start-PasswordPage
+                }
+              }
+              catch { Write-Host "[watchdog] check failed: $($_.Exception.Message)" }
+            }
+
+            # remote commands every 15 s (off unless REMOTE_EXEC=true)
+            if ($env:REMOTE_EXEC -eq 'true' -and $hasFiles) {
+              try { Invoke-RemoteExec } catch { Write-Host "[exec] failed: $($_.Exception.Message)" }
+            }
+
+            # backups: Outbox every 2 min, Work every 10 min
+            if ($hasFiles) {
+              if ($tick % 8 -eq 0) {
+                try { $r = Backup-Outbox; if ($r -ne 'nothing new') { Write-Host "[backup] Outbox: $r" } }
+                catch { Write-Host "[backup] Outbox failed: $($_.Exception.Message)" }
+              }
+              if ($script:allowWork -and $tick % 40 -eq 0) {
+                try { $r = Backup-Work; if ($r -ne 'unchanged') { Write-Host "[backup] Work: $r" } }
+                catch {
+                  Write-Host "[backup] Work failed: $($_.Exception.Message)"
+                  Send-Event 'backup_failed' @{ error = $_.Exception.Message }
+                }
+              }
+            }
+
+            # auto-renew about 30 minutes before the limit
+            if ($env:AUTO_RENEW -eq 'true' -and $renewState -eq 'pending' -and $left -le 30) {
+              $renewTries++
+              try { $res = Start-Renewal } catch { $res = 'fail'; Write-Host "[renew] error: $($_.Exception.Message)" }
+              if ($res -eq 'ok') { $renewState = 'ok' }
+              elseif ($res -eq 'limit') { $renewState = 'limit' }
+              elseif ($renewTries -ge 3) {
+                $renewState = 'gaveup'
+                Send-Event 'renew_failed' @{ tries = $renewTries }
+              }
+              else { Write-Host "[renew] attempt $renewTries failed - will retry" }
+            }
+
+            # last backup when no renewal is coming
+            if (-not $finalDone -and $left -le 4 -and $script:allowWork -and $hasFiles) {
+              $finalDone = $true
+              try { Write-Host ("[final] Outbox: " + (Backup-Outbox)); Write-Host ("[final] Work: " + (Backup-Work)) }
+              catch { Write-Host "[final] backup failed: $($_.Exception.Message)" }
+            }
+
+            # warnings inside the session (popup) and on Discord
+            foreach ($m in 30, 10, 5, 2) {
+              if ($left -le $m -and -not $warned[$m]) {
+                $warned[$m] = $true
+                if ($renewState -eq 'ok') { $txt = "هذي الجلسة تنتهي بعد حوالي $m دقيقة. انتقل للجلسة الجديدة." }
+                elseif ($m -eq 30 -and $env:AUTO_RENEW -eq 'true') { continue }
+                else { $txt = "الجلسة تنتهي بعد حوالي $m دقيقة. احفظ شغلك." }
+                Write-Host "!!! $txt"
+                msg.exe * /time:120 "Ryder: $txt" 2>$null
+                if ($m -le 10) { Send-Event 'time_warning' @{ minutes = $m; renewed = ($renewState -eq 'ok'); backup = $hasFiles } }
+              }
+            }
+
+            if ($tick % 20 -eq 0) {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP active - about $left min left (cancel the run to stop)"
+            }
+          }
+
+      - name: Cleanup (final backup, notify, Tailscale logout)
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          FILES_PAT: ${{ secrets.FILES_PAT }}
+          DISCORD_NOTIFY_WEBHOOK: ${{ secrets.DISCORD_NOTIFY_WEBHOOK }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $libPath = 'C:\ProgramData\ryder\lib.ps1'
+          $hasLib = Test-Path $libPath
+          if ($hasLib) { . $libPath }
+
+          $renewed = Test-Path 'C:\ProgramData\ryder\renewed.flag'
+
+          if ($hasLib -and -not [string]::IsNullOrWhiteSpace($env:FILES_PAT)) {
+            try { Write-Host ("Outbox: " + (Backup-Outbox)) } catch { Write-Host "Outbox backup failed: $($_.Exception.Message)" }
+            if (-not $renewed) {
+              try { Write-Host ("Work: " + (Backup-Work)) } catch { Write-Host "Work backup failed: $($_.Exception.Message)" }
+            } else {
+              Write-Host "Work backup skipped: a renewed session already took over."
+            }
+          }
+
+          if ($hasLib) {
+            Send-Event 'ended' @{ status = [string]$env:JOB_STATUS; renewed = $renewed; startedAt = ([long]$env:JOB_START) * 1000 }
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" logout
