@@ -16,7 +16,7 @@ WORKFLOW = "main.yml"
 REF = "main"
 FILES_REPO = "Giraium/Ryder-files"
 # /exec runs commands inside the session. Keep "false" unless you really want it.
-ENABLE_EXEC = "false"
+ENABLE_EXEC = "true"
 
 # "true": command replies are visible to everyone in the channel. "false": only you see them.
 PUBLIC_REPLIES = "true"
